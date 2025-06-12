@@ -65,13 +65,14 @@ def week_range_iso() -> Tuple[str, str]:
 
 
 def map_level(level: str) -> str:
-    return "A1" if level.lower() == "discovery" else level
+    level = level.lower()
+    return "A1" if level in ["discovery", "adventures"] else level
 
 
 def hms(seconds: int) -> str:
     h = seconds // 3600
     m = (seconds % 3600) // 60
-    return f"{h}h {m}m"
+    return f"{int(h)}h{int(m)}m"
 
 # ---------------------------------------------------------------------------
 # Duplicate tracking ---------------------------------------------------------
