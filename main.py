@@ -50,7 +50,7 @@ if not all([NOTION_API_KEY, FLEXGE_API_KEY]):
     raise RuntimeError("Missing one or more required environment variables: NOTION_API_KEY, FLEXGE_API_KEY")
 
 notion = NotionClient(auth=NOTION_API_KEY)
-httpx_client = httpx.AsyncClient(base_url=FLEXGE_API_BASE, headers={"Authorization": f"Bearer {FLEXGE_API_KEY}"})
+httpx_client = httpx.AsyncClient(base_url=FLEXGE_API_BASE, headers={"x-api-key": FLEXGE_API_KEY})
 
 # ---------------------------------------------------------------------------
 # Configurable IDs
