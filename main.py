@@ -1,284 +1,229 @@
 # fastapi_flexge_notion_sync/main.py
 """
-FastAPI application that polls the Flexge API every minute for fresh study‑hour data and synchronises
-it to Notion, with double‑duplicate protection.
+FastAPI service – Flexge ⟶ Notion + limpeza semanal
+===================================================
+* **sync_job**: busca alunos na Flexge a cada 10 min e insere/atualiza no Notion.
+* **clean_job**: toda segunda‑feira 02:00 UTC arquiva (deleta) **todas** as páginas do database para começar a semana do zero.
+  * depois limpa o set `seen_keys` para evitar falsos duplicados.
+* Chaves e IDs via `.env`.
 
-Key design choices
-------------------
-* **FastAPI** provides HTTP endpoints plus life‑cycle hooks for background polling.
-* **httpx.AsyncClient** is used for non‑blocking requests to Flexge.
-* **APScheduler** schedules recurring jobs (one‑minute cadence) without manual threading.
-* **Duplicate defence**
-  1. An in‑memory `seen_keys` set built at start‑up from a Notion search (⏩ first barrier).
-  2. A real‑time check with Notion *right before each insert* (⏩ second barrier).
-* Secrets are loaded from environment variables ‑ never hard‑coded.
-  Create a `.env` (or set variables in Render / Docker) containing::
-
-      NOTION_API_KEY=...
-      FLEXGE_API_KEY=...
-      FLEXGE_API_BASE=https://partner-api.flexge.com/external/students
-
-Run locally with::
-
-      uvicorn main:app --reload
+Rodar localmente
+----------------
+```bash
+pip install fastapi uvicorn httpx apscheduler python-dotenv notion-client
+uvicorn main:app --reload
+```
 """
 
 import os
-import re
-import asyncio
 import logging
 import unicodedata
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Set, Tuple, List
+import re
+import asyncio
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Set, Tuple
 
 import httpx
-from fastapi import FastAPI, BackgroundTasks, status
+from fastapi import BackgroundTasks, FastAPI, status
 from fastapi.responses import JSONResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-
+from apscheduler.triggers.cron import CronTrigger
 from notion_client import Client as NotionClient
 
 # ---------------------------------------------------------------------------
-# Environment & global clients
+# Environment ----------------------------------------------------------------
 # ---------------------------------------------------------------------------
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-FLEXGE_API_BASE = os.getenv("FLEXGE_API_BASE", "https://partner-api.flexge.com/external/students")
+NOTION_DB_ID = os.getenv("NOTION_DB_ID", "15f206acf37d8068b114db042dd45191")
 FLEXGE_API_KEY = os.getenv("FLEXGE_API_KEY")
+FLEXGE_BASE = os.getenv("FLEXGE_API_BASE", "https://partner-api.flexge.com/external")
 
 if not all([NOTION_API_KEY, FLEXGE_API_KEY]):
-    raise RuntimeError("Missing one or more required environment variables: NOTION_API_KEY, FLEXGE_API_KEY")
+    raise RuntimeError("NOTION_API_KEY and FLEXGE_API_KEY must be defined in environment")
 
+# ---------------------------------------------------------------------------
+# Clients --------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 notion = NotionClient(auth=NOTION_API_KEY)
-httpx_client = httpx.AsyncClient(base_url=FLEXGE_API_BASE, headers={"x-api-key": FLEXGE_API_KEY})
+httpx_client = httpx.AsyncClient(base_url=FLEXGE_BASE, headers={"x-api-key": FLEXGE_API_KEY, "accept": "application/json"})
 
 # ---------------------------------------------------------------------------
-# Configurable IDs
-# ---------------------------------------------------------------------------
-DB_NOTES_INPUT = os.getenv("NOTION_DB_INPUT", "13e206acf37d8012b5e4c1f1e7e6391e")
-DB_REPORTS_REVIEW = os.getenv("NOTION_DB_REVIEW", "14d206ac-f37d-8038-8c24-fb4cd9c6b8e3")
-TEACHER_DB_MAP = {
-    "Teacher Mayara": "14d206acf37d80a6a49ffd315d2b4b05",
-    "Teacher Karina": "159206acf37d80e39c4ef52ded59a1be",
-    "Teacher Karol": "159206acf37d8020985adfe948a04f39",
-    "Teacher Vanessa": "183206acf37d805d88abc1fdad61e831",
-    "Teacher Jhouselyn": "199206acf37d811d83adf0fecf9ecd63",
-}
-
-# student_pages_map shortened for brevity – import from separate module or use Notion search if preferred
-from student_pages import student_pages_map  # noqa: E402, assume you put the dict in student_pages.py
-
-# ---------------------------------------------------------------------------
-# Helpers
+# Helpers --------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
-def normalize_string(s: str) -> str:
-    """Remove accents and lowercase for robust comparisons."""
-    s = unicodedata.normalize("NFD", s)
-    s = s.encode("ascii", "ignore").decode("utf-8")
-    return s.lower().strip()
+def normalize(text: str) -> str:
+    text = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Mn").lower().strip()
 
 
-def combine_multi_select(property_dict: Dict) -> str:
-    mul = property_dict.get("multi_select", [])
-    return " ".join(i["name"].strip() for i in mul if "name" in i)
+def week_range_iso() -> Tuple[str, str]:
+    today = datetime.now(timezone.utc)
+    start = (today - timedelta(days=today.weekday())).replace(hour=0, minute=1, second=0, microsecond=0)
+    end = (start + timedelta(days=6)).replace(hour=23, minute=59, second=59, microsecond=0)
+    return start.isoformat().replace("+00:00", "Z"), end.isoformat().replace("+00:00", "Z")
 
 
-def extract_level(text: str) -> str:
-    valid = {"PREA1", "PRE-A1", "A1", "A2", "B1", "B2", "C1", "C2"}
-    for token in re.split(r"[^A-Za-z0-9]+", text.upper()):
-        if token in valid:
-            return "A1" if token.startswith("PRE") else token
-    return "unknown"
+def map_level(level: str) -> str:
+    return "A1" if level.lower() == "discovery" else level
 
 
-def safe_rich_text(prop: Dict, default: str = "") -> str:
-    rt = prop.get("rich_text", [])
-    if rt and "text" in rt[0]:
-        return rt[0]["text"].get("content", "").strip() or default
-    return default
-
+def hms(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h}h {m}m"
 
 # ---------------------------------------------------------------------------
-# Duplicate tracking – first barrier (in‑memory)
+# Duplicate tracking ---------------------------------------------------------
 # ---------------------------------------------------------------------------
-SeenKey = Tuple[str, str]  # (student_name, class_date)
-seen_keys: Set[SeenKey] = set()
-
+Seen = Tuple[str, str]  # (normalized name, level)
+seen_keys: Set[Seen] = set()
 
 async def warm_seen_keys() -> None:
-    """Load existing keys from the review DB into memory on startup."""
-    logging.info("Pre‑loading existing report signatures from Notion REVIEW DB ...")
+    logging.info("Loading existing pages from Notion…")
     cursor = None
     while True:
-        resp = notion.databases.query(database_id=DB_REPORTS_REVIEW, page_size=100, start_cursor=cursor)
+        resp = notion.databases.query(database_id=NOTION_DB_ID, start_cursor=cursor, page_size=100)
         for page in resp["results"]:
-            props = page["properties"]
-            try:
-                sname = props["Student Name"]["rich_text"][0]["plain_text"]
-                cdate = props["Class Date"]["date"]["start"]
-                seen_keys.add((normalize_string(sname), cdate))
-            except Exception:
-                continue
+            name = page["properties"]["Nome"]["title"][0]["plain_text"]
+            level_prop = page["properties"].get("Nível", {})
+            level = level_prop.get("multi_select", [{}])[0].get("name", "") if level_prop else ""
+            seen_keys.add((normalize(name), level))
         cursor = resp.get("next_cursor")
         if not cursor:
             break
-    logging.info("Loaded %d existing report signatures.", len(seen_keys))
-
+    logging.info("Loaded %d signatures.", len(seen_keys))
 
 # ---------------------------------------------------------------------------
-# Flexge polling logic
+# Flexge integration ---------------------------------------------------------
 # ---------------------------------------------------------------------------
-async def fetch_flexge_updates() -> List[Dict]:
-    """Call Flexge API and return the list of *new* class reports since last run."""
-    try:
-        # Calculate date range
-        today = datetime.now(timezone.utc)
-        start_of_week = (today - timedelta(days=today.weekday())).replace(hour=0, minute=1, second=0, microsecond=0)
-        end_of_week = (start_of_week + timedelta(days=6)).replace(hour=23, minute=59, second=59, microsecond=0)
-        
-        # Format dates for API
-        start_date = start_of_week.strftime('%Y-%m-%dT%H:%M:%SZ')
-        end_date = end_of_week.strftime('%Y-%m-%dT%H:%M:%SZ')
-        
-        # Parameters matching the working Flask version
+async def fetch_students() -> List[Dict]:
+    start, end = week_range_iso()
+    students, page = [], 1
+    while True:
         params = {
-            'page': 1,
-            'isPlacementTestOnly': 'false',
-            'studiedTimeRange[from]': start_date,
-            'studiedTimeRange[to]': end_date,
+            "page": page,
+            "isPlacementTestOnly": "false",
+            "studiedTimeRange[from]": start,
+            "studiedTimeRange[to]": end,
         }
-        
-        resp = await httpx_client.get("", params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        students = data.get('docs', [])
-        
-        # Process each student
-        results = []
-        for student in students:
-            student_id = student.get('id')
-            # Get student level
-            overview_resp = await httpx_client.get(f"/{student_id}/overview")
-            overview_resp.raise_for_status()
-            overview_data = overview_resp.json()
-            active_courses = overview_data.get('activeCourses', [])
-            level = active_courses[0].get('name', 'Indefinido') if active_courses else 'Indefinido'
-            if level == "Adventures":
-                level = "A1"
-            
-            # Calculate total study time
-            total_time = student.get('weekTime', {}).get('studiedTime', 0)
-            for execution in student.get('executions', []):
-                total_time += execution.get('studiedTime', 0)
-            
-            # Format the result
-            results.append({
-                'student_name': student.get('name'),
-                'level': level,
-                'total_time': total_time,
-                'class_date': start_date  # Using start date as class date
-            })
-            
-        return results
-    except httpx.HTTPError as exc:
-        logging.error("Flexge API error: %s", exc)
-        return []
+        r = await httpx_client.get("/students", params=params)
+        r.raise_for_status()
+        docs = r.json().get("docs", [])
+        if not docs:
+            break
+        students.extend(docs)
+        page += 1
+    logging.info("Flexge returned %d students", len(students))
+    return students
 
 
-async def process_flexge_record(rec: Dict) -> None:
-    """Process a single Flexge class record and push to Notion after dedup."""
-    student_name_raw = rec.get("student_name", "Unnamed Student")
-    student_name_norm = normalize_string(student_name_raw)
-    class_date = rec.get("class_date")  # ISO 8601 string
+def total_time(stu: Dict) -> int:
+    t = stu.get("weekTime", {}).get("studiedTime", 0)
+    for ex in stu.get("executions", []):
+        t += ex.get("studiedTime", 0)
+    return t
 
-    sig: SeenKey = (student_name_norm, class_date)
-    if sig in seen_keys:
-        logging.info("Skipping duplicate record for %s on %s (memory cache).", student_name_raw, class_date)
+async def flexge_level(student_id: str) -> str:
+    r = await httpx_client.get(f"/students/{student_id}/overview")
+    r.raise_for_status()
+    courses = r.json().get("activeCourses", [])
+    return courses[0].get("name", "Indefinido") if courses else "Indefinido"
+
+# ---------------------------------------------------------------------------
+# Notion helpers -------------------------------------------------------------
+# ---------------------------------------------------------------------------
+async def page_exists(name: str) -> str | None:
+    resp = notion.databases.query(
+        database_id=NOTION_DB_ID,
+        filter={"property": "Nome", "title": {"equals": name}},
+        page_size=1,
+    )
+    if resp["results"]:
+        return resp["results"][0]["id"]
+    return None
+
+async def create_or_update(name: str, level: str, seconds: int) -> None:
+    key = (normalize(name), level)
+    if key in seen_keys:
         return
 
-    # 🔒 Second barrier – query Notion for the same combination before insert
-    dup_filter = {
-        "and": [
-            {"property": "Student Name", "rich_text": {"equals": student_name_raw}},
-            {"property": "Class Date", "date": {"equals": class_date}},
-        ]
-    }
-    dup_resp = notion.databases.query(database_id=DB_REPORTS_REVIEW, page_size=1, filter=dup_filter)
-    if dup_resp.get("results"):
-        seen_keys.add(sig)  # add to cache to avoid requerying next time
-        logging.info("Duplicate detected in Notion – skipping %s on %s.", student_name_raw, class_date)
-        return
+    formatted = hms(seconds)
+    page_id = await page_exists(name)
 
-    # Prepare fields
-    theme = rec.get("theme", "No Theme")
-    overview = rec.get("overview", "ABSENT STUDENT")
-    recommendations = rec.get("recommendations", "ABSENT STUDENT")
-    level_string = rec.get("level", theme)  # fallback
-    level = extract_level(level_string)
-
-    # Insert into Notion REVIEW DB as Pending Review
-    try:
+    if page_id:
+        notion.pages.update(page_id=page_id, properties={"Horas de Estudo": {"rich_text": [{"text": {"content": formatted}}]}})
+        logging.info("Updated %s → %s", name, formatted)
+    else:
         notion.pages.create(
-            parent={"database_id": DB_REPORTS_REVIEW},
+            parent={"database_id": NOTION_DB_ID},
             properties={
-                "Student Name": {"rich_text": [{"text": {"content": student_name_raw}}]},
-                "Class Theme": {"rich_text": [{"text": {"content": theme}}]},
-                "Class Date": {"date": {"start": class_date}},
-                "Performance Overview": {"rich_text": [{"text": {"content": overview}}]},
-                "Recommendations for Enhancement": {"rich_text": [{"text": {"content": recommendations}}]},
-                "Which teacher does the student belong to?": {"multi_select": [{"name": rec.get("teacher", "Unknown Teacher")} ]},
-                "Status": {"select": {"name": "Pending Review"}},
+                "Nome": {"title": [{"text": {"content": name}}]},
+                "Horas de Estudo": {"rich_text": [{"text": {"content": formatted}}]},
+                "Nível": {"multi_select": [{"name": level}]},
             },
         )
-        seen_keys.add(sig)
-        logging.info("Report for %s (%s) inserted to Notion REVIEW.", student_name_raw, class_date)
-    except Exception as exc:
-        logging.error("Failed to insert Notion page: %s", exc)
+        logging.info("Created page for %s (%s | %s)", name, level, formatted)
+    seen_keys.add(key)
 
-
-async def flexge_job() -> None:
-    """Main scheduled job: fetch updates and push to Notion."""
-    updates = await fetch_flexge_updates()
-    tasks = [process_flexge_record(rec) for rec in updates]
-    if tasks:
+# ---------------------------------------------------------------------------
+# Jobs -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+async def sync_job() -> None:
+    try:
+        students = await fetch_students()
+        tasks = []
+        for st in students:
+            sid, name = st["id"], st["name"]
+            seconds = total_time(st)
+            level_raw = await flexge_level(sid)
+            level = map_level(level_raw)
+            tasks.append(create_or_update(name, level, seconds))
         await asyncio.gather(*tasks)
+    except Exception:
+        logging.exception("Sync job failed")
 
+async def clean_job() -> None:
+    logging.info("Weekly clean – archiving all pages in Notion DB …")
+    cursor = None
+    removed = 0
+    while True:
+        resp = notion.databases.query(database_id=NOTION_DB_ID, page_size=100, start_cursor=cursor)
+        for page in resp["results"]:
+            notion.pages.update(page_id=page["id"], archived=True)
+            removed += 1
+        cursor = resp.get("next_cursor")
+        if not cursor:
+            break
+    seen_keys.clear()
+    logging.info("Archived %d pages and cleared seen_keys.", removed)
 
 # ---------------------------------------------------------------------------
-# FastAPI app & scheduler
+# FastAPI --------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Flexge → Notion sync", version="0.1.0")
-
+app = FastAPI(title="Flexge → Notion", version="0.3.0")
 scheduler = AsyncIOScheduler()
 
-
 @app.on_event("startup")
-async def startup_event() -> None:
+async def startup() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     await warm_seen_keys()
 
-    # schedule flexge polling every 60 seconds
-    scheduler.add_job(flexge_job, IntervalTrigger(seconds=60), id="flexge-poll")
+    scheduler.add_job(sync_job, IntervalTrigger(minutes=10), id="sync")
+    scheduler.add_job(clean_job, CronTrigger(day_of_week="mon", hour=2, minute=0, timezone="UTC"), id="weekly-clean")
     scheduler.start()
-    logging.info("Scheduler started – polling Flexge every 60 seconds.")
-
+    logging.info("Scheduler running (sync every 10 min; clean Mondays 02:00 UTC)")
 
 @app.on_event("shutdown")
-async def shutdown_event() -> None:
+async def shutdown() -> None:
     await httpx_client.aclose()
     scheduler.shutdown()
-
-
-# Manual trigger endpoints --------------------------------------------------
 
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
-
 @app.post("/sync", status_code=status.HTTP_202_ACCEPTED)
 async def manual_sync(background_tasks: BackgroundTasks):
-    """Manually trigger Flexge sync without waiting for scheduler."""
-    background_tasks.add_task(flexge_job)
-    return JSONResponse(content={"detail": "Sync scheduled."}, status_code=status.HTTP_202_ACCEPTED)
+    background_tasks.add_task(sync_job)
+    return JSONResponse({"detail": "Sync scheduled"}, status_code=status.HTTP_202_ACCEPTED)

@@ -1,6 +1,66 @@
-# Flexge-Notion Sync Service
+# Flexge → Notion Sync Service
 
-A FastAPI application that synchronizes Flexge study-hour data with Notion databases in real-time.
+Serviço FastAPI que sincroniza dados de estudo da Flexge para o Notion, com limpeza semanal automática.
+
+## Funcionalidades
+
+* **Sincronização a cada 10 minutos**: Busca alunos na Flexge e atualiza/cria páginas no Notion com:
+  * Nome do aluno
+  * Nível atual
+  * Horas de estudo na semana
+
+* **Limpeza Semanal**: Toda segunda-feira às 02:00 UTC:
+  * Arquiva todas as páginas do database
+  * Limpa o cache de duplicados
+  * Prepara o database para uma nova semana
+
+* **Proteção contra Duplicados**: 
+  * Cache em memória de páginas existentes
+  * Verificação em tempo real antes de cada inserção
+
+## Configuração
+
+1. Crie um arquivo `.env` com as seguintes variáveis:
+
+```bash
+NOTION_API_KEY=seu_token_notion
+NOTION_DB_ID=id_do_database_notion
+FLEXGE_API_KEY=sua_chave_api_flexge
+FLEXGE_API_BASE=https://partner-api.flexge.com/external
+```
+
+2. Instale as dependências:
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Execute o serviço:
+
+```bash
+uvicorn main:app --reload
+```
+
+## Endpoints
+
+* `GET /health`: Verifica status do serviço
+* `POST /sync`: Dispara sincronização manual
+
+## Estrutura do Database Notion
+
+O database deve ter as seguintes propriedades:
+
+* `Nome`: Title
+* `Nível`: Multi-select
+* `Horas de Estudo`: Rich text
+
+## Desenvolvimento
+
+* Python 3.9+
+* FastAPI para API REST
+* APScheduler para jobs recorrentes
+* httpx para requisições assíncronas
+* notion-client para integração com Notion
 
 ## Features
 
@@ -30,7 +90,6 @@ Create a `.env` file with the following variables:
 NOTION_API_KEY=your_notion_api_key
 FLEXGE_API_KEY=your_flexge_api_key
 FLEXGE_API_BASE=https://partner-api.flexge.com/external
-OPENAI_API_KEY=your_openai_api_key
 ```
 
 4. Run the application:
