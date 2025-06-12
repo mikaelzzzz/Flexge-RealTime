@@ -1,3 +1,4 @@
+# fastapi_flexge_notion_sync/main.py
 """
 FastAPI application that polls the Flexge API every minute for fresh study‑hour data and synchronises
 it to Notion, with double‑duplicate protection.
@@ -15,8 +16,7 @@ Key design choices
 
       NOTION_API_KEY=...
       FLEXGE_API_KEY=...
-      FLEXGE_API_BASE=https://partner-api.flexge.com/external
-      OPENAI_API_KEY=...
+      FLEXGE_API_BASE=https://partner-api.flexge.com/external/students
 
 Run locally with::
 
@@ -38,21 +38,18 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from notion_client import Client as NotionClient
-import openai
 
 # ---------------------------------------------------------------------------
 # Environment & global clients
 # ---------------------------------------------------------------------------
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-FLEXGE_API_BASE = os.getenv("FLEXGE_API_BASE", "https://partner-api.flexge.com/external")
+FLEXGE_API_BASE = os.getenv("FLEXGE_API_BASE", "https://partner-api.flexge.com/external/students")
 FLEXGE_API_KEY = os.getenv("FLEXGE_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-if not all([NOTION_API_KEY, FLEXGE_API_KEY, OPENAI_API_KEY]):
-    raise RuntimeError("Missing one or more required environment variables: NOTION_API_KEY, FLEXGE_API_KEY, OPENAI_API_KEY")
+if not all([NOTION_API_KEY, FLEXGE_API_KEY]):
+    raise RuntimeError("Missing one or more required environment variables: NOTION_API_KEY, FLEXGE_API_KEY")
 
 notion = NotionClient(auth=NOTION_API_KEY)
-openai.api_key = OPENAI_API_KEY  # sync client works fine inside background jobs
 httpx_client = httpx.AsyncClient(base_url=FLEXGE_API_BASE, headers={"Authorization": f"Bearer {FLEXGE_API_KEY}"})
 
 # ---------------------------------------------------------------------------
@@ -102,21 +99,6 @@ def safe_rich_text(prop: Dict, default: str = "") -> str:
     return default
 
 
-async def call_openai(prompt: str) -> str:
-    """Lightweight async wrapper around OpenAI chat completion."""
-    try:
-        resp = await openai.ChatCompletion.acreate(
-            model="gpt-4o-mini",  # cheaper model – tweak as needed
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=256,
-            temperature=0.7,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as exc:
-        logging.error("OpenAI call failed: %s", exc)
-        return prompt  # fallback: return original
-
-
 # ---------------------------------------------------------------------------
 # Duplicate tracking – first barrier (in‑memory)
 # ---------------------------------------------------------------------------
@@ -148,16 +130,11 @@ async def warm_seen_keys() -> None:
 # Flexge polling logic
 # ---------------------------------------------------------------------------
 async def fetch_flexge_updates() -> List[Dict]:
-    """Call Flexge API and return the list of *new* class reports since last run.
-
-    👉 **Replace** the endpoint and parsing according to your real Flexge API.
-    """
+    """Call Flexge API and return the list of *new* class reports since last run."""
     try:
-        # Example endpoint – adjust to real
-        resp = await httpx_client.get("/classes/last-minute")
+        resp = await httpx_client.get("")  # Base URL already includes /students
         resp.raise_for_status()
         data = resp.json()
-        # Suppose `data` is a list of dicts with keys: student_name, class_date, theme, overview, recommendations, teacher
         return data
     except httpx.HTTPError as exc:
         logging.error("Flexge API error: %s", exc)
@@ -188,21 +165,12 @@ async def process_flexge_record(rec: Dict) -> None:
         logging.info("Duplicate detected in Notion – skipping %s on %s.", student_name_raw, class_date)
         return
 
-    # Prepare rich text fields
+    # Prepare fields
     theme = rec.get("theme", "No Theme")
-    overview_orig = rec.get("overview", "ABSENT STUDENT")
-    recom_orig = rec.get("recommendations", "ABSENT STUDENT")
+    overview = rec.get("overview", "ABSENT STUDENT")
+    recommendations = rec.get("recommendations", "ABSENT STUDENT")
     level_string = rec.get("level", theme)  # fallback
     level = extract_level(level_string)
-
-    # Improve texts with GPT (async)
-    improved_overview, improved_recom = overview_orig, recom_orig
-    if overview_orig.lower() != "absent student":
-        over_prompt = f"""You are an experienced language teacher with CEFR knowledge. Student level {level}. Rewrite below overview in clear English ≤150 words, include name {student_name_raw}.\n\n{overview_orig}"""
-        improved_overview = await call_openai(over_prompt)
-    if recom_orig.lower() != "absent student":
-        recom_prompt = f"""Rewrite the recommendations for {student_name_raw} (level {level}) into ≤150‑word clear English.\n\n{recom_orig}"""
-        improved_recom = await call_openai(recom_prompt)
 
     # Insert into Notion REVIEW DB as Pending Review
     try:
@@ -212,8 +180,8 @@ async def process_flexge_record(rec: Dict) -> None:
                 "Student Name": {"rich_text": [{"text": {"content": student_name_raw}}]},
                 "Class Theme": {"rich_text": [{"text": {"content": theme}}]},
                 "Class Date": {"date": {"start": class_date}},
-                "Performance Overview": {"rich_text": [{"text": {"content": improved_overview}}]},
-                "Recommendations for Enhancement": {"rich_text": [{"text": {"content": improved_recom}}]},
+                "Performance Overview": {"rich_text": [{"text": {"content": overview}}]},
+                "Recommendations for Enhancement": {"rich_text": [{"text": {"content": recommendations}}]},
                 "Which teacher does the student belong to?": {"multi_select": [{"name": rec.get("teacher", "Unknown Teacher")} ]},
                 "Status": {"select": {"name": "Pending Review"}},
             },
@@ -268,4 +236,4 @@ async def health() -> Dict[str, str]:
 async def manual_sync(background_tasks: BackgroundTasks):
     """Manually trigger Flexge sync without waiting for scheduler."""
     background_tasks.add_task(flexge_job)
-    return JSONResponse(content={"detail": "Sync scheduled."}, status_code=status.HTTP_202_ACCEPTED) 
+    return JSONResponse(content={"detail": "Sync scheduled."}, status_code=status.HTTP_202_ACCEPTED)
