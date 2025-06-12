@@ -66,7 +66,12 @@ def week_range_iso() -> Tuple[str, str]:
 
 def map_level(level: str) -> str:
     level = level.lower()
-    return "A1" if level in ["discovery", "adventures"] else level
+    if level in ["discovery", "adventures"]:
+        return "A1"
+    # Converte para maiúsculo e garante o formato correto (A1, A2, B1, etc)
+    if len(level) == 2 and level[0] in ['a', 'b', 'c'] and level[1].isdigit():
+        return level.upper()
+    return level.upper()
 
 
 def hms(seconds: int) -> str:
