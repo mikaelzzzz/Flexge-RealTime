@@ -28,7 +28,7 @@ import re
 import asyncio
 import logging
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Set, Tuple, List
 
 import httpx
@@ -132,10 +132,55 @@ async def warm_seen_keys() -> None:
 async def fetch_flexge_updates() -> List[Dict]:
     """Call Flexge API and return the list of *new* class reports since last run."""
     try:
-        resp = await httpx_client.get("")  # Base URL already includes /students
+        # Calculate date range
+        today = datetime.now(timezone.utc)
+        start_of_week = (today - timedelta(days=today.weekday())).replace(hour=0, minute=1, second=0, microsecond=0)
+        end_of_week = (start_of_week + timedelta(days=6)).replace(hour=23, minute=59, second=59, microsecond=0)
+        
+        # Format dates for API
+        start_date = start_of_week.strftime('%Y-%m-%dT%H:%M:%SZ')
+        end_date = end_of_week.strftime('%Y-%m-%dT%H:%M:%SZ')
+        
+        # Parameters matching the working Flask version
+        params = {
+            'page': 1,
+            'isPlacementTestOnly': 'false',
+            'studiedTimeRange[from]': start_date,
+            'studiedTimeRange[to]': end_date,
+        }
+        
+        resp = await httpx_client.get("", params=params)
         resp.raise_for_status()
         data = resp.json()
-        return data
+        students = data.get('docs', [])
+        
+        # Process each student
+        results = []
+        for student in students:
+            student_id = student.get('id')
+            # Get student level
+            overview_resp = await httpx_client.get(f"/{student_id}/overview")
+            overview_resp.raise_for_status()
+            overview_data = overview_resp.json()
+            active_courses = overview_data.get('activeCourses', [])
+            level = active_courses[0].get('name', 'Indefinido') if active_courses else 'Indefinido'
+            if level == "Adventures":
+                level = "A1"
+            
+            # Calculate total study time
+            total_time = student.get('weekTime', {}).get('studiedTime', 0)
+            for execution in student.get('executions', []):
+                total_time += execution.get('studiedTime', 0)
+            
+            # Format the result
+            results.append({
+                'student_name': student.get('name'),
+                'level': level,
+                'total_time': total_time,
+                'class_date': start_date  # Using start date as class date
+            })
+            
+        return results
     except httpx.HTTPError as exc:
         logging.error("Flexge API error: %s", exc)
         return []
