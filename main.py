@@ -2,7 +2,7 @@
 """
 FastAPI service – Flexge ⟶ Notion + limpeza semanal
 ===================================================
-* **sync_job**: busca alunos na Flexge a cada 10 min e insere/atualiza no Notion.
+* **sync_job**: busca alunos na Flexge a cada 1 min e insere/atualiza no Notion.
 * **clean_job**: toda segunda‑feira 02:00 UTC arquiva (deleta) **todas** as páginas do database para começar a semana do zero.
   * depois limpa o set `seen_keys` para evitar falsos duplicados.
 * Chaves e IDs via `.env`.
@@ -37,7 +37,7 @@ from notion_client import Client as NotionClient
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 NOTION_DB_ID = os.getenv("NOTION_DB_ID", "15f206acf37d8068b114db042dd45191")
 FLEXGE_API_KEY = os.getenv("FLEXGE_API_KEY")
-FLEXGE_BASE = os.getenv("FLEXGE_API_BASE", "https://partner-api.flexge.com/external")
+FLEXGE_BASE = os.getenv("FLEXGE_API_BASE", "https://partner-api.flexge.com/external/students")
 
 if not all([NOTION_API_KEY, FLEXGE_API_KEY]):
     raise RuntimeError("NOTION_API_KEY and FLEXGE_API_KEY must be defined in environment")
@@ -113,7 +113,7 @@ async def fetch_students() -> List[Dict]:
             "studiedTimeRange[from]": start,
             "studiedTimeRange[to]": end,
         }
-        r = await httpx_client.get("/students", params=params)
+        r = await httpx_client.get("", params=params)  # Empty string because base_url already includes /students
         r.raise_for_status()
         docs = r.json().get("docs", [])
         if not docs:
@@ -131,7 +131,7 @@ def total_time(stu: Dict) -> int:
     return t
 
 async def flexge_level(student_id: str) -> str:
-    r = await httpx_client.get(f"/students/{student_id}/overview")
+    r = await httpx_client.get(f"/{student_id}/overview")  # Updated to match new base URL
     r.raise_for_status()
     courses = r.json().get("activeCourses", [])
     return courses[0].get("name", "Indefinido") if courses else "Indefinido"
@@ -215,10 +215,10 @@ async def startup() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     await warm_seen_keys()
 
-    scheduler.add_job(sync_job, IntervalTrigger(minutes=10), id="sync")
+    scheduler.add_job(sync_job, IntervalTrigger(minutes=1), id="sync")
     scheduler.add_job(clean_job, CronTrigger(day_of_week="mon", hour=2, minute=0, timezone="UTC"), id="weekly-clean")
     scheduler.start()
-    logging.info("Scheduler running (sync every 10 min; clean Mondays 02:00 UTC)")
+    logging.info("Scheduler running (sync every 1 min; clean Mondays 02:00 UTC)")
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
