@@ -113,7 +113,7 @@ async def fetch_students() -> List[Dict]:
             "studiedTimeRange[from]": start,
             "studiedTimeRange[to]": end,
         }
-        r = await httpx_client.get("", params=params)  # Empty string because base_url already includes /students
+        r = await httpx_client.get("/students", params=params)
         r.raise_for_status()
         docs = r.json().get("docs", [])
         if not docs:
@@ -131,7 +131,7 @@ def total_time(stu: Dict) -> int:
     return t
 
 async def flexge_level(student_id: str) -> str:
-    r = await httpx_client.get(f"/{student_id}/overview")  # Updated to match new base URL
+    r = await httpx_client.get(f"/students/{student_id}/overview")  # Updated to match new base URL
     r.raise_for_status()
     courses = r.json().get("activeCourses", [])
     return courses[0].get("name", "Indefinido") if courses else "Indefinido"
