@@ -61,7 +61,10 @@ def map_level(level: str) -> str:
     return lvl.upper() if len(lvl) == 2 else level.upper()
 
 def hms(seconds: int) -> str:
-    return f"{seconds//3600}h{(seconds%3600)//60}m"
+    """Converte segundos em string '2h53m' sem casas decimais."""
+    h = seconds // 3600                     # horas inteiras
+    m = (seconds % 3600) // 60             # minutos restantes
+    return f"{int(h)}h{int(m)}m"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Duplicate tracking
