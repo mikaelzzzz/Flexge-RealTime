@@ -129,29 +129,9 @@ async def page_exists(nome: str) -> str | None:
     resp = notion.databases.query(database_id=NOTION_DB_ID, filter={"property": "Nome", "title": {"equals": nome}}, page_size=1)
     return resp["results"][0]["id"] if resp["results"] else None
 
-async def create_or_update(nome: str, nivel: str, segundos: int) -> None:
-    key = (normalize(nome), nivel)
-    if key in seen_keys:
-        return
-    tempo_fmt = hms(segundos)
-    page_id = await page_exists(nome)
+if key in seen_keys:
+    return
 
-    if page_id:
-        notion.pages.update(page_id=page_id, properties={"Horas de Estudo": {"rich_text": [{"text": {"content": tempo_fmt}}]}})
-        logging.info("Atualizado %s → %s", nome, tempo_fmt)
-    else:
-        notion.pages.create(
-            parent={"database_id": NOTION_DB_ID},
-            properties={
-                "Nome": {"title": [{"text": {"content": nome}}]},
-                "Horas de Estudo": {"rich_text": [{"text": {"content": tempo_fmt}}]},
-                "Nível": {"multi_select": [{"name": nivel}]},
-            },
-        )
-        logging.info("Criada página para %s (%s | %s)", nome, nivel, tempo_fmt)
-    seen_keys.add(key)
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Jobs
 # ─────────────────────────────────────────────────────────────────────────────
 async def sync_job() -> None:
