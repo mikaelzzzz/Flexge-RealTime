@@ -126,11 +126,41 @@ async def flexge_level(student_id: str) -> str:
 # Notion helpers
 # ─────────────────────────────────────────────────────────────────────────────
 async def page_exists(nome: str) -> str | None:
-    resp = notion.databases.query(database_id=NOTION_DB_ID, filter={"property": "Nome", "title": {"equals": nome}}, page_size=1)
+    resp = notion.databases.query(
+        database_id=NOTION_DB_ID,
+        filter={"property": "Nome", "title": {"equals": nome}},
+        page_size=1,
+    )
     return resp["results"][0]["id"] if resp["results"] else None
 
-if key in seen_keys:
-    return
+async def create_or_update(nome: str, nivel: str, segundos: int) -> None:
+    tempo_fmt = hms(segundos)
+    page_id = await page_exists(nome)
+
+    if page_id:
+        # Atualiza se já existe
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "Horas de Estudo": {"rich_text": [{"text": {"content": tempo_fmt}}]},
+                "Nível": {"multi_select": [{"name": nivel}]}
+            },
+        )
+        logging.info("Atualizado %s → %s", nome, tempo_fmt)
+    else:
+        key = (normalize(nome), nivel)
+        if key in seen_keys:
+            return  # evita duplicata na criação
+        notion.pages.create(
+            parent={"database_id": NOTION_DB_ID},
+            properties={
+                "Nome": {"title": [{"text": {"content": nome}}]},
+                "Horas de Estudo": {"rich_text": [{"text": {"content": tempo_fmt}}]},
+                "Nível": {"multi_select": [{"name": nivel}]}
+            },
+        )
+        seen_keys.add(key)
+        logging.info("Criada página para %s (%s | %s)", nome, nivel, tempo_fmt)
 
 # Jobs
 # ─────────────────────────────────────────────────────────────────────────────
